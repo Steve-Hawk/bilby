@@ -18,6 +18,19 @@ from ..utils import (
 )
 
 
+def _identity_transform(value):
+    return value
+
+
+def _unity_jacobian_transform(*values):
+    if not values:
+        return 1.0
+    arrays = [np.asarray(val) for val in values]
+    broadcast = np.broadcast_arrays(*arrays)
+    target = broadcast[0]
+    return np.ones_like(target, dtype=float)
+
+
 class PriorDict(dict):
     def __init__(self, dictionary=None, filename=None, conversion_function=None):
         """A dictionary of priors
@@ -948,6 +961,787 @@ class ConditionalPriorDict(PriorDict):
     def __delitem__(self, key):
         super(ConditionalPriorDict, self).__delitem__(key)
         self._resolve_conditions()
+
+
+class TransformedPriorView(Prior):
+    """View of a transformed parameter prior.
+
+    This proxy exposes a transformed parameter as a :class:`Prior` instance
+    while delegating probability and sampling calculations back to the parent
+    :class:`TransformedConditionalPriorDict`.
+    """
+
+    def __init__(
+        self,
+        parent,
+        group_id,
+        transformed_key,
+        base_prior,
+        index,
+        definition,
+        *,
+        minimum=None,
+        maximum=None,
+        latex_label=None,
+        unit=None,
+    ):
+        self._parent = parent
+        self._group_id = group_id
+        self._definition = definition
+        self._index = index
+        self._base_prior = base_prior
+        self._native_keys = tuple(definition["native_keys"])
+        self._transformed_keys = tuple(definition["transformed_keys"])
+        inferred_minimum, inferred_maximum = self._infer_bounds(minimum, maximum)
+        base_label = getattr(base_prior, "latex_label", transformed_key)
+        base_unit = getattr(base_prior, "unit", None)
+        super(TransformedPriorView, self).__init__(
+            name=transformed_key,
+            latex_label=latex_label or base_label,
+            unit=unit if unit is not None else base_unit,
+            minimum=inferred_minimum,
+            maximum=inferred_maximum,
+            check_range_nonzero=False,
+            boundary=base_prior.boundary,
+        )
+        self._is_fixed = base_prior.is_fixed
+        required = getattr(base_prior, "required_variables", [])
+        transformed_required = []
+        for var in required:
+            transformed_required.extend(parent._transformed_keys_for_native(var))
+        # Preserve order while removing duplicates
+        seen = set()
+        ordered = []
+        for var in transformed_required:
+            if var not in seen:
+                ordered.append(var)
+                seen.add(var)
+        self.required_variables = ordered
+
+    def _infer_bounds(self, minimum, maximum):
+        if minimum is not None and maximum is not None:
+            return minimum, maximum
+        if len(self._native_keys) == 1:
+            native_key = self._native_keys[0]
+            try:
+                result = self._parent._evaluate_forward(
+                    self._definition, {native_key: self._base_prior.minimum}
+                )
+                lower = np.asarray(result[self.name])
+                result = self._parent._evaluate_forward(
+                    self._definition, {native_key: self._base_prior.maximum}
+                )
+                upper = np.asarray(result[self.name])
+                return float(lower), float(upper)
+            except Exception:
+                pass
+        return self._base_prior.minimum, self._base_prior.maximum
+
+    def sample(self, size=None, **kwargs):
+        samples = self._parent.sample_subset(keys=[self.name], size=size)
+        return samples[self.name]
+
+    def rescale(self, val, **kwargs):
+        result = self._parent.rescale([self.name], [val])
+        return result[0]
+
+    def prob(self, val, **kwargs):
+        sample = {self.name: val}
+        sample.update(kwargs)
+        self._require_group_values(sample)
+        return self._parent.prob(sample)
+
+    def ln_prob(self, val, axis=None, normalized=True, **kwargs):
+        sample = {self.name: val}
+        sample.update(kwargs)
+        self._require_group_values(sample)
+        return self._parent.ln_prob(sample, axis=axis, normalized=normalized)
+
+    def cdf(self, val):
+        if len(self._transformed_keys) != 1:
+            raise NotImplementedError(
+                "CDF evaluation for transformed parameter '{}' requires all {} values".format(
+                    self.name, self._transformed_keys
+                )
+            )
+        native = self._parent._evaluate_inverse(
+            self._definition, {self.name: val}
+        )[self._native_keys[0]]
+        return self._base_prior.cdf(native)
+
+    def _require_group_values(self, sample):
+        missing = [
+            key
+            for key in self._transformed_keys
+            if key not in sample and key != self.name
+        ]
+        if missing:
+            raise KeyError(
+                "Values for transformed keys {} are required to evaluate '{}'".format(
+                    missing, self.name
+                )
+            )
+
+    @property
+    def least_recently_sampled(self):
+        return self._parent._transformed_least_recently_sampled.get(self.name)
+
+    @least_recently_sampled.setter
+    def least_recently_sampled(self, value):
+        self._parent._transformed_least_recently_sampled[self.name] = value
+
+
+class TransformedConditionalPriorDict(ConditionalPriorDict):
+    """A conditional prior dictionary that supports parameter transformations.
+
+    This class augments :class:`ConditionalPriorDict` by allowing users to
+    specify forward and inverse transformations between a native parameter
+    space and a transformed parameter space. Sampling and probability
+    evaluations are performed in the native space, while public facing APIs can
+    operate in the transformed space. Jacobian corrections associated with the
+    transformations are accounted for when computing probabilities.
+
+    Parameters
+    ----------
+    dictionary : dict, optional
+        Mapping from native parameter names to prior objects.
+    filename : str, optional
+        Filename containing a serialized prior dictionary.
+    conversion_function : callable, optional
+        Conversion function passed through to :class:`PriorDict`.
+    transformations : dict, optional
+        Dictionary describing transformations. Each entry can either be keyed
+        by the native parameter name or by the transformed name. A definition
+        must contain the following fields:
+
+        ``native_key`` (optional)
+            Name of the native parameter. Required when the dictionary key is
+            the transformed name.
+        ``transformed_key`` (optional)
+            Name of the transformed parameter. Defaults to the native key.
+        ``forward`` (callable, optional)
+            Function mapping native values to transformed values. Defaults to
+            the identity transformation.
+        ``inverse`` (callable, optional)
+            Function mapping transformed values to native values. Defaults to
+            the identity transformation.
+        ``jacobian`` (callable, optional)
+            Function returning the determinant of the Jacobian matrix of the
+            forward transformation evaluated in the native space. Defaults to a
+            function returning ones with the appropriate shape.
+    """
+
+    def __init__(
+        self,
+        dictionary=None,
+        filename=None,
+        conversion_function=None,
+        transformations=None,
+    ):
+        self._forward_transforms = dict()
+        self._inverse_transforms = dict()
+        self._jacobian_transforms = dict()
+        self._transformed_least_recently_sampled = dict()
+        self._transform_definitions = dict()
+        self._pending_transformations = transformations or dict()
+        self._transformed_priors = dict()
+        self._user_conversion_function = conversion_function
+        self._transformation_groups = dict()
+        self._group_by_native = dict()
+        self._group_by_transformed = dict()
+        super(TransformedConditionalPriorDict, self).__init__(
+            dictionary=dictionary,
+            filename=filename,
+            conversion_function=None,
+        )
+        self.conversion_function = self._compose_conversion_function(
+            self._user_conversion_function
+        )
+        self._initialize_transformations(self._pending_transformations)
+
+    # ------------------------------------------------------------------
+    # Setup helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _as_tuple(value, default=None):
+        if value is None:
+            return tuple(default or [])
+        if isinstance(value, (list, tuple)):
+            return tuple(value)
+        return (value,)
+
+    def _initialize_transformations(self, transformations):
+        self._register_default_transforms()
+        for key, definition in (transformations or {}).items():
+            if not isinstance(definition, dict):
+                raise TypeError(
+                    "Transformation definition for '{}' must be a dictionary".format(key)
+                )
+            definition = definition.copy()
+            normalized = self._normalize_transformation_definition(key, definition)
+            if normalized is None:
+                continue
+            self._register_transformation_group(**normalized)
+
+    def _register_default_transforms(self):
+        for native_key in list(dict.keys(self)):
+            self._register_identity_group(native_key)
+
+    def _register_identity_group(self, native_key):
+        group_id = self._group_by_native.get(native_key)
+        if group_id is not None and self._transformation_groups.get(group_id, {}).get(
+            "native_keys"
+        ) == (native_key,):
+            return
+        definition = dict(
+            native_keys=(native_key,),
+            transformed_keys=(native_key,),
+            forward=_identity_transform,
+            inverse=_identity_transform,
+            jacobian=_unity_jacobian_transform,
+            raw_definition=dict(native_key=native_key, transformed_key=native_key),
+        )
+        self._unregister_group((native_key,))
+        self._store_transformation_group(definition)
+
+    def _normalize_transformation_definition(self, key, definition):
+        native_keys = None
+        if "native_keys" in definition:
+            native_keys = self._as_tuple(definition.pop("native_keys"))
+        elif "native_key" in definition:
+            native_keys = self._as_tuple(definition.pop("native_key"))
+        elif key in self:
+            native_keys = (key,)
+        if not native_keys:
+            logger.debug(
+                "Ignoring transformation definition for %s as native keys are unknown", key
+            )
+            return None
+        for native_key in native_keys:
+            if native_key not in self:
+                logger.debug(
+                    "Ignoring transformation for %s as native key %s is unknown",
+                    key,
+                    native_key,
+                )
+                return None
+        transformed_keys = None
+        if "transformed_keys" in definition:
+            transformed_keys = self._as_tuple(definition.pop("transformed_keys"))
+        elif "transformed_key" in definition:
+            transformed_keys = self._as_tuple(definition.pop("transformed_key"))
+        elif key not in native_keys:
+            transformed_keys = (key,)
+        if not transformed_keys:
+            transformed_keys = native_keys
+        if len(transformed_keys) != len(native_keys):
+            raise ValueError(
+                "Number of transformed keys ({}) must match native keys ({})".format(
+                    len(transformed_keys), len(native_keys)
+                )
+            )
+        forward = definition.pop("forward", _identity_transform)
+        inverse = definition.pop("inverse", _identity_transform)
+        jacobian = definition.pop("jacobian", _unity_jacobian_transform)
+        raw_definition = dict(definition)
+        raw_definition.update(
+            native_keys=native_keys,
+            transformed_keys=transformed_keys,
+            forward=forward,
+            inverse=inverse,
+            jacobian=jacobian,
+        )
+        return dict(
+            native_keys=native_keys,
+            transformed_keys=transformed_keys,
+            forward=forward,
+            inverse=inverse,
+            jacobian=jacobian,
+            raw_definition=raw_definition,
+        )
+
+    def _register_transformation_group(
+        self, native_keys, transformed_keys, forward, inverse, jacobian, raw_definition
+    ):
+        for native_key in native_keys:
+            group_id = self._group_by_native.get(native_key)
+            if group_id is not None:
+                self._unregister_group(group_id)
+        definition = dict(
+            native_keys=tuple(native_keys),
+            transformed_keys=tuple(transformed_keys),
+            forward=forward,
+            inverse=inverse,
+            jacobian=jacobian,
+            raw_definition=raw_definition,
+        )
+        self._store_transformation_group(definition)
+
+    def _store_transformation_group(self, definition):
+        native_keys = definition["native_keys"]
+        transformed_keys = definition["transformed_keys"]
+        group_id = native_keys
+        self._transformation_groups[group_id] = definition
+        for native_key in native_keys:
+            self._group_by_native[native_key] = group_id
+        for index, transformed_key in enumerate(transformed_keys):
+            self._group_by_transformed[transformed_key] = (group_id, index)
+            self._forward_transforms[transformed_key] = definition["forward"]
+            self._inverse_transforms[transformed_key] = definition["inverse"]
+            self._jacobian_transforms[transformed_key] = definition["jacobian"]
+            self._transformed_least_recently_sampled.setdefault(transformed_key, None)
+            if transformed_key != native_keys[min(index, len(native_keys) - 1)] or len(native_keys) > 1:
+                self._transformed_priors[transformed_key] = self._create_transformed_prior(
+                    native_keys=native_keys,
+                    transformed_keys=transformed_keys,
+                    index=index,
+                    definition=definition,
+                )
+        self._transform_definitions[group_id] = definition
+        self._transformed_keys_cache = None
+
+    def _unregister_group(self, group_id):
+        definition = self._transformation_groups.pop(group_id, None)
+        if definition is None:
+            return
+        for native_key in definition["native_keys"]:
+            self._group_by_native.pop(native_key, None)
+        for transformed_key in definition["transformed_keys"]:
+            self._group_by_transformed.pop(transformed_key, None)
+            self._forward_transforms.pop(transformed_key, None)
+            self._inverse_transforms.pop(transformed_key, None)
+            self._jacobian_transforms.pop(transformed_key, None)
+            self._transformed_priors.pop(transformed_key, None)
+            self._transformed_least_recently_sampled.pop(transformed_key, None)
+        self._transform_definitions.pop(group_id, None)
+        self._transformed_keys_cache = None
+
+    def register_transformation(
+        self,
+        native_key=None,
+        native_keys=None,
+        transformed_key=None,
+        transformed_keys=None,
+        forward=None,
+        inverse=None,
+        jacobian=None,
+        **metadata,
+    ):
+        """Register or update a transformation for one or more native parameters."""
+
+        if native_keys is None:
+            native_keys = ()
+        native_keys = list(native_keys)
+        if native_key is not None:
+            native_keys.append(native_key)
+        if not native_keys:
+            raise ValueError("At least one native key must be supplied")
+        for key in native_keys:
+            if key not in self:
+                raise KeyError("Unknown native key '{}'".format(key))
+        if transformed_keys is None:
+            transformed_keys = []
+        transformed_keys = list(transformed_keys)
+        if transformed_key is not None:
+            transformed_keys.append(transformed_key)
+        if not transformed_keys:
+            transformed_keys = list(native_keys)
+        if len(native_keys) != len(transformed_keys):
+            raise ValueError(
+                "Number of transformed keys ({}) must match native keys ({})".format(
+                    len(transformed_keys), len(native_keys)
+                )
+            )
+        definition = dict(metadata)
+        definition.update(
+            native_keys=tuple(native_keys),
+            transformed_keys=tuple(transformed_keys),
+            forward=forward or _identity_transform,
+            inverse=inverse or _identity_transform,
+            jacobian=jacobian or _unity_jacobian_transform,
+        )
+        normalized = self._normalize_transformation_definition(
+            native_keys[0], definition
+        )
+        if normalized is None:
+            raise ValueError("Could not normalize transformation definition")
+        self._register_transformation_group(**normalized)
+
+    # ------------------------------------------------------------------
+    # Key utilities
+    # ------------------------------------------------------------------
+    def _transformed_keys_for_native(self, native_key):
+        group_id = self._group_by_native.get(native_key)
+        if group_id is None:
+            return [native_key]
+        definition = self._transformation_groups.get(group_id)
+        if definition is None:
+            return [native_key]
+        return list(definition["transformed_keys"])
+
+    def _native_keys_for(self, key):
+        if dict.__contains__(self, key):
+            return [key]
+        mapping = self._group_by_transformed.get(key)
+        if mapping is None:
+            raise KeyError("Unknown key '{}'".format(key))
+        group_id, _ = mapping
+        definition = self._transformation_groups.get(group_id)
+        if definition is None:
+            raise KeyError("Unknown key '{}'".format(key))
+        return list(definition["native_keys"])
+
+    def _convert_keys_to_native(self, keys):
+        native_keys = []
+        for key in keys:
+            for native_key in self._native_keys_for(key):
+                if native_key not in native_keys:
+                    native_keys.append(native_key)
+        return native_keys
+
+    # ------------------------------------------------------------------
+    # Transformation helpers
+    # ------------------------------------------------------------------
+    def _transform_native_samples(self, samples, transformed_keys):
+        transformed_samples = dict()
+        group_cache = dict()
+        for key in transformed_keys:
+            if dict.__contains__(self, key):
+                if key in samples:
+                    transformed_samples[key] = samples[key]
+                    self._transformed_least_recently_sampled[key] = samples[key]
+                continue
+            mapping = self._group_by_transformed.get(key)
+            if mapping is None:
+                continue
+            group_id, _ = mapping
+            if group_id not in group_cache:
+                definition = self._transformation_groups.get(group_id)
+                if definition is None:
+                    continue
+                native_values = {
+                    native_key: samples[native_key]
+                    for native_key in definition["native_keys"]
+                    if native_key in samples
+                }
+                if len(native_values) != len(definition["native_keys"]):
+                    continue
+                group_cache[group_id] = self._evaluate_forward(definition, native_values)
+            group_result = group_cache.get(group_id, {})
+            if key in group_result:
+                transformed_samples[key] = group_result[key]
+                self._transformed_least_recently_sampled[key] = group_result[key]
+        return transformed_samples
+
+    def _transform_to_native(self, sample, update_least_recently_sampled=False):
+        native_sample = dict()
+        log_abs_det_jacobian = None
+        for key, value in sample.items():
+            if dict.__contains__(self, key):
+                native_sample[key] = value
+        for group_id, definition in self._transformation_groups.items():
+            transformed_keys = definition["transformed_keys"]
+            if all(key in sample for key in transformed_keys):
+                transformed_values = {key: sample[key] for key in transformed_keys}
+                inverse_result = self._evaluate_inverse(definition, transformed_values)
+                native_sample.update(inverse_result)
+                jacobian_value = self._evaluate_jacobian(definition, inverse_result)
+                term = np.log(np.abs(jacobian_value))
+                if log_abs_det_jacobian is None:
+                    log_abs_det_jacobian = term
+                else:
+                    log_abs_det_jacobian = log_abs_det_jacobian + term
+                if update_least_recently_sampled:
+                    for native_key, native_value in inverse_result.items():
+                        if native_key in self:
+                            self[native_key].least_recently_sampled = native_value
+                    for transformed_key in transformed_keys:
+                        self._transformed_least_recently_sampled[
+                            transformed_key
+                        ] = sample[transformed_key]
+            elif any(key in sample for key in transformed_keys):
+                missing = [key for key in transformed_keys if key not in sample]
+                raise KeyError(
+                    "Sample is missing transformed keys {} required to invert transformation for {}".format(
+                        missing, definition["native_keys"]
+                    )
+                )
+        if log_abs_det_jacobian is None:
+            log_abs_det_jacobian = 0.0
+        else:
+            log_abs_det_jacobian = np.asarray(log_abs_det_jacobian)
+        return native_sample, log_abs_det_jacobian
+
+    def _evaluate_forward(self, definition, native_values):
+        ordered_values = [native_values[key] for key in definition["native_keys"]]
+        result = definition["forward"](*ordered_values)
+        return self._format_group_result(result, definition["transformed_keys"])
+
+    def _evaluate_inverse(self, definition, transformed_values):
+        ordered_values = [transformed_values[key] for key in definition["transformed_keys"]]
+        result = definition["inverse"](*ordered_values)
+        return self._format_group_result(result, definition["native_keys"])
+
+    def _evaluate_jacobian(self, definition, native_values):
+        ordered_values = [native_values[key] for key in definition["native_keys"]]
+        result = definition["jacobian"](*ordered_values)
+        array = np.asarray(result)
+        dimension = len(definition["native_keys"])
+        if array.ndim >= 2 and array.shape[-2:] == (dimension, dimension):
+            return np.linalg.det(array)
+        return array
+
+    def _format_group_result(self, result, keys):
+        if isinstance(result, dict):
+            missing = [key for key in keys if key not in result]
+            if missing:
+                raise KeyError(
+                    "Transformation result missing entries for keys {}".format(missing)
+                )
+            return {key: result[key] for key in keys}
+        if len(keys) == 1:
+            return {keys[0]: result}
+        if isinstance(result, (list, tuple)):
+            if len(result) != len(keys):
+                raise ValueError(
+                    "Transformation returned {} values but {} were expected".format(
+                        len(result), len(keys)
+                    )
+                )
+            return {key: result[index] for index, key in enumerate(keys)}
+        array = np.asarray(result)
+        if array.shape[0] == len(keys):
+            return {key: array[index] for index, key in enumerate(keys)}
+        if array.shape[-1] == len(keys):
+            return {
+                key: array[..., index]
+                for index, key in enumerate(keys)
+            }
+        raise ValueError(
+            "Transformation output has incompatible shape {} for keys {}".format(
+                array.shape, keys
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Sampling interface
+    # ------------------------------------------------------------------
+    def sample(self, size=None):
+        return self.sample_subset_constrained(keys=self.transformed_keys, size=size)
+
+    def sample_subset(self, keys=iter([]), size=None):
+        keys = list(keys)
+        if len(keys) == 0:
+            keys = self.transformed_keys
+        native_keys = self._convert_keys_to_native(keys)
+        native_samples = super(TransformedConditionalPriorDict, self).sample_subset(
+            keys=native_keys, size=size
+        )
+        return self._transform_native_samples(native_samples, keys)
+
+    def sample_subset_constrained(self, keys=iter([]), size=None):
+        keys = list(keys)
+        if len(keys) == 0:
+            keys = self.transformed_keys
+        native_keys = self._convert_keys_to_native(keys)
+        native_samples = super(
+            TransformedConditionalPriorDict, self
+        ).sample_subset_constrained(keys=native_keys, size=size)
+        return self._transform_native_samples(native_samples, keys)
+
+    def sample_subset_constrained_as_array(self, keys=iter([]), size=None):
+        keys = list(keys)
+        use_keys = keys if len(keys) > 0 else self.transformed_keys
+        samples_dict = self.sample_subset_constrained(keys=use_keys, size=size)
+        samples_dict = {key: np.atleast_1d(val) for key, val in samples_dict.items()}
+        samples_list = [samples_dict[key] for key in use_keys]
+        return np.array(samples_list)
+
+    # ------------------------------------------------------------------
+    # Probability interface
+    # ------------------------------------------------------------------
+    def prob(self, sample, **kwargs):
+        native_sample, log_abs_det_jacobian = self._transform_to_native(sample)
+        native_prob = super(TransformedConditionalPriorDict, self).prob(
+            native_sample, **kwargs
+        )
+        transformed_prob = native_prob / np.exp(log_abs_det_jacobian)
+        for key in sample:
+            if key in self._transformed_least_recently_sampled:
+                self._transformed_least_recently_sampled[key] = sample[key]
+        return transformed_prob
+
+    def ln_prob(self, sample, axis=None, normalized=True):
+        native_sample, log_abs_det_jacobian = self._transform_to_native(sample)
+        native_ln_prob = super(TransformedConditionalPriorDict, self).ln_prob(
+            native_sample, axis=axis, normalized=normalized
+        )
+        transformed_ln_prob = native_ln_prob - log_abs_det_jacobian
+        for key in sample:
+            if key in self._transformed_least_recently_sampled:
+                self._transformed_least_recently_sampled[key] = sample[key]
+        return transformed_ln_prob
+
+    # ------------------------------------------------------------------
+    # Rescaling utilities
+    # ------------------------------------------------------------------
+    def rescale(self, keys, theta):
+        keys = list(keys)
+        native_keys = self._convert_keys_to_native(keys)
+        native_values = super(TransformedConditionalPriorDict, self).rescale(
+            native_keys, theta
+        )
+        native_samples = dict(zip(native_keys, native_values))
+        transformed_samples = self._transform_native_samples(native_samples, keys)
+        return [
+            transformed_samples[key]
+            if key in transformed_samples
+            else native_samples.get(key)
+            for key in keys
+        ]
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def native_keys(self):
+        return list(self.keys())
+
+    @property
+    def transformed_keys(self):
+        if getattr(self, "_transformed_keys_cache", None) is None:
+            ordered = []
+            for native_key in self.sorted_keys:
+                for transformed_key in self._transformed_keys_for_native(native_key):
+                    if transformed_key not in ordered:
+                        ordered.append(transformed_key)
+            self._transformed_keys_cache = ordered
+        return list(self._transformed_keys_cache)
+
+    @property
+    def transformed_sorted_keys_without_fixed_parameters(self):
+        keys = []
+        for native_key in self.sorted_keys_without_fixed_parameters:
+            for transformed_key in self._transformed_keys_for_native(native_key):
+                if transformed_key not in keys:
+                    keys.append(transformed_key)
+        return keys
+
+    @property
+    def transformed_least_recently_sampled(self):
+        return dict(self._transformed_least_recently_sampled)
+
+    @property
+    def non_fixed_keys(self):
+        return self.transformed_sorted_keys_without_fixed_parameters
+
+    # ------------------------------------------------------------------
+    # Dictionary interface overrides
+    # ------------------------------------------------------------------
+    def __getitem__(self, key):
+        if key in self._transformed_priors:
+            return self._transformed_priors[key]
+        return super(TransformedConditionalPriorDict, self).__getitem__(key)
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def __contains__(self, key):
+        if key in self._transformed_priors:
+            return True
+        if key in self._group_by_transformed:
+            return True
+        return dict.__contains__(self, key)
+
+    def __setitem__(self, key, value):
+        super(TransformedConditionalPriorDict, self).__setitem__(key, value)
+        self._register_identity_group(key)
+
+    def __delitem__(self, key):
+        super(TransformedConditionalPriorDict, self).__delitem__(key)
+        group_id = self._group_by_native.get(key)
+        remaining_natives = []
+        if group_id is not None:
+            definition = self._transformation_groups.get(group_id)
+            if definition is not None:
+                remaining_natives = [
+                    native for native in definition["native_keys"] if native != key
+                ]
+            self._unregister_group(group_id)
+        self._transformed_least_recently_sampled.pop(key, None)
+        for native in remaining_natives:
+            if native in self:
+                self._register_identity_group(native)
+        self._transformed_keys_cache = None
+
+    # ------------------------------------------------------------------
+    # Conversion helpers
+    # ------------------------------------------------------------------
+    def _augment_sample_with_native(self, sample):
+        if sample is None:
+            return sample
+        augmented = dict(sample)
+        for group_id, definition in self._transformation_groups.items():
+            transformed_keys = definition["transformed_keys"]
+            if not all(key in sample for key in transformed_keys):
+                continue
+            transformed_values = {key: sample[key] for key in transformed_keys}
+            inverse_result = self._evaluate_inverse(definition, transformed_values)
+            for native_key, native_value in inverse_result.items():
+                augmented.setdefault(native_key, native_value)
+        return augmented
+
+    def _compose_conversion_function(self, user_conversion):
+        def conversion(sample, *args, **kwargs):
+            augmented = self._augment_sample_with_native(sample)
+            if user_conversion is None:
+                return augmented
+            return user_conversion(augmented, *args, **kwargs)
+
+        return conversion
+
+    def _create_transformed_prior(
+        self,
+        *,
+        native_keys,
+        transformed_keys,
+        index,
+        definition,
+    ):
+        base_native_index = min(index, len(native_keys) - 1)
+        base_native_key = native_keys[base_native_index]
+        base_prior = dict.__getitem__(self, base_native_key)
+        transformed_key = transformed_keys[index]
+        return TransformedPriorView(
+            parent=self,
+            group_id=tuple(native_keys),
+            transformed_key=transformed_key,
+            base_prior=base_prior,
+            index=index,
+            definition=definition,
+            minimum=self._definition_value_for_key(
+                definition, "minimum", transformed_key, index
+            ),
+            maximum=self._definition_value_for_key(
+                definition, "maximum", transformed_key, index
+            ),
+            latex_label=self._definition_value_for_key(
+                definition, "latex_label", transformed_key, index
+            ),
+            unit=self._definition_value_for_key(definition, "unit", transformed_key, index),
+        )
+
+    def _definition_value_for_key(self, definition, field, transformed_key, index):
+        raw = definition.get("raw_definition", {})
+        value = raw.get(field)
+        if isinstance(value, dict):
+            return value.get(transformed_key)
+        if isinstance(value, (list, tuple)):
+            if len(value) == len(definition["transformed_keys"]):
+                return value[index]
+        return value
 
 
 class DirichletPriorDict(ConditionalPriorDict):

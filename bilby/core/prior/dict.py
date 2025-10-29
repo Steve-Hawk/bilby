@@ -1183,6 +1183,13 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                 continue
             self._register_transformation_group(**normalized)
 
+    def _pop_key_tuple(self, definition, plural_key, singular_key):
+        if plural_key in definition:
+            return self._as_tuple(definition.pop(plural_key))
+        if singular_key in definition:
+            return self._as_tuple(definition.pop(singular_key))
+        return None
+
     def _register_default_transforms(self):
         for native_key in list(dict.keys(self)):
             self._register_identity_group(native_key)
@@ -1205,12 +1212,8 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         self._store_transformation_group(definition)
 
     def _normalize_transformation_definition(self, key, definition):
-        native_keys = None
-        if "native_keys" in definition:
-            native_keys = self._as_tuple(definition.pop("native_keys"))
-        elif "native_key" in definition:
-            native_keys = self._as_tuple(definition.pop("native_key"))
-        elif key in self:
+        native_keys = self._pop_key_tuple(definition, "native_keys", "native_key")
+        if native_keys is None and key in self:
             native_keys = (key,)
         if not native_keys:
             logger.debug(
@@ -1225,12 +1228,10 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                     native_key,
                 )
                 return None
-        transformed_keys = None
-        if "transformed_keys" in definition:
-            transformed_keys = self._as_tuple(definition.pop("transformed_keys"))
-        elif "transformed_key" in definition:
-            transformed_keys = self._as_tuple(definition.pop("transformed_key"))
-        elif key not in native_keys:
+        transformed_keys = self._pop_key_tuple(
+            definition, "transformed_keys", "transformed_key"
+        )
+        if transformed_keys is None and key not in native_keys:
             transformed_keys = (key,)
         if not transformed_keys:
             transformed_keys = native_keys

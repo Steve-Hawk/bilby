@@ -18,6 +18,19 @@ from ..utils import (
 )
 
 
+def _identity_transform(value):
+    return value
+
+
+def _unity_jacobian_transform(*values):
+    if not values:
+        return 1.0
+    arrays = [np.asarray(val) for val in values]
+    broadcast = np.broadcast_arrays(*arrays)
+    target = broadcast[0]
+    return np.ones_like(target, dtype=float)
+
+
 class PriorDict(dict):
     def __init__(self, dictionary=None, filename=None, conversion_function=None):
         """A dictionary of priors
@@ -1150,19 +1163,6 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
     # Setup helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _identity(value):
-        return value
-
-    @staticmethod
-    def _unity_jacobian(*values):
-        if not values:
-            return 1.0
-        arrays = [np.asarray(val) for val in values]
-        broadcast = np.broadcast_arrays(*arrays)
-        target = broadcast[0]
-        return np.ones_like(target, dtype=float)
-
-    @staticmethod
     def _as_tuple(value, default=None):
         if value is None:
             return tuple(default or [])
@@ -1196,9 +1196,9 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         definition = dict(
             native_keys=(native_key,),
             transformed_keys=(native_key,),
-            forward=self._identity,
-            inverse=self._identity,
-            jacobian=self._unity_jacobian,
+            forward=_identity_transform,
+            inverse=_identity_transform,
+            jacobian=_unity_jacobian_transform,
             raw_definition=dict(native_key=native_key, transformed_key=native_key),
         )
         self._unregister_group((native_key,))
@@ -1240,9 +1240,9 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                     len(transformed_keys), len(native_keys)
                 )
             )
-        forward = definition.pop("forward", self._identity)
-        inverse = definition.pop("inverse", self._identity)
-        jacobian = definition.pop("jacobian", self._unity_jacobian)
+        forward = definition.pop("forward", _identity_transform)
+        inverse = definition.pop("inverse", _identity_transform)
+        jacobian = definition.pop("jacobian", _unity_jacobian_transform)
         raw_definition = dict(definition)
         raw_definition.update(
             native_keys=native_keys,
@@ -1356,9 +1356,9 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         definition.update(
             native_keys=tuple(native_keys),
             transformed_keys=tuple(transformed_keys),
-            forward=forward or self._identity,
-            inverse=inverse or self._identity,
-            jacobian=jacobian or self._unity_jacobian,
+            forward=forward or _identity_transform,
+            inverse=inverse or _identity_transform,
+            jacobian=jacobian or _unity_jacobian_transform,
         )
         normalized = self._normalize_transformation_definition(
             native_keys[0], definition

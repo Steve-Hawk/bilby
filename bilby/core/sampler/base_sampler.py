@@ -1,5 +1,6 @@
 import datetime
 import os
+import inspect
 import shutil
 import signal
 import sys
@@ -359,17 +360,23 @@ class Sampler(object):
         parameter key list depending on whether
         the respective parameter is fixed.
         """
+        search_keys = []
         for key in self.priors:
-            if (
-                isinstance(self.priors[key], Prior)
-                and self.priors[key].is_fixed is False
-            ):
-                self._search_parameter_keys.append(key)
-            elif isinstance(self.priors[key], Constraint):
+            if isinstance(self.priors[key], Constraint):
                 self._constraint_parameter_keys.append(key)
             elif isinstance(self.priors[key], DeltaFunction):
                 self.parameters[key] = self.priors[key].sample()
                 self._fixed_parameter_keys.append(key)
+            elif (
+                isinstance(self.priors[key], Prior)
+                and self.priors[key].is_fixed is False
+            ):
+                search_keys.append(key)
+
+        if hasattr(self.priors, "non_fixed_keys"):
+            self._search_parameter_keys = list(self.priors.non_fixed_keys)
+        else:
+            self._search_parameter_keys = search_keys
 
     def _log_information_about_priors_and_likelihood(self):
         logger.info("Analysis priors:")
@@ -560,9 +567,36 @@ class Sampler(object):
 
         params = deepcopy(self.parameters)
         params.update({key: t for key, t in zip(self._search_parameter_keys, theta)})
+        params = self._apply_conversion_function(params)
         return _safe_likelihood_call(
             self.likelihood, parameters=params, use_ratio=self.use_ratio
         )
+
+    def _apply_conversion_function(self, params):
+        conversion = getattr(self.priors, "conversion_function", None)
+        if conversion is None:
+            return params
+        try:
+            signature = inspect.signature(conversion)
+        except (TypeError, ValueError):
+            signature = None
+        kwargs = {}
+        if signature:
+            parameters = signature.parameters
+            if "likelihood" in parameters:
+                kwargs["likelihood"] = self.likelihood
+            if "priors" in parameters:
+                kwargs["priors"] = self.priors
+            if "npool" in parameters:
+                kwargs["npool"] = getattr(self, "_npool", 1)
+            if any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in parameters.values()
+            ):
+                kwargs.setdefault("likelihood", self.likelihood)
+                kwargs.setdefault("priors", self.priors)
+                kwargs.setdefault("npool", getattr(self, "_npool", 1))
+        return conversion(params, **kwargs)
 
     def get_random_draw_from_prior(self):
         """Get a random draw from the prior distribution

@@ -22,13 +22,13 @@ def _identity_transform(value):
     return value
 
 
-def _unity_jacobian_transform(*values):
+def _zero_log_jacobian_transform(*values):
     if not values:
-        return 1.0
+        return 0.0
     arrays = [np.asarray(val) for val in values]
     broadcast = np.broadcast_arrays(*arrays)
     target = broadcast[0]
-    return np.ones_like(target, dtype=float)
+    return np.zeros_like(target, dtype=float)
 
 
 class PriorDict(dict):
@@ -1114,11 +1114,13 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         by the native parameter name or by the transformed name. A definition
         must contain the following fields:
 
-        ``native_key`` (optional)
-            Name of the native parameter. Required when the dictionary key is
-            the transformed name.
-        ``transformed_key`` (optional)
-            Name of the transformed parameter. Defaults to the native key.
+        ``native_keys`` (optional)
+            Tuple of native parameter names. Required when the dictionary key
+            is the transformed name. When omitted and the dictionary key is a
+            native parameter, the value defaults to a single-element tuple
+            containing that key.
+        ``transformed_keys`` (optional)
+            Tuple of transformed parameter names. Defaults to the native keys.
         ``forward`` (callable, optional)
             Function mapping native values to transformed values. Defaults to
             the identity transformation.
@@ -1126,9 +1128,10 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             Function mapping transformed values to native values. Defaults to
             the identity transformation.
         ``jacobian`` (callable, optional)
-            Function returning the determinant of the Jacobian matrix of the
-            forward transformation evaluated in the native space. Defaults to a
-            function returning ones with the appropriate shape.
+            Function returning the logarithm of the absolute value of the
+            determinant of the Jacobian matrix of the forward transformation
+            evaluated in the transformed space. Defaults to a function returning
+            zeros with the appropriate shape.
     """
 
     def __init__(
@@ -1183,11 +1186,9 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                 continue
             self._register_transformation_group(**normalized)
 
-    def _pop_key_tuple(self, definition, plural_key, singular_key):
+    def _pop_key_tuple(self, definition, plural_key):
         if plural_key in definition:
             return self._as_tuple(definition.pop(plural_key))
-        if singular_key in definition:
-            return self._as_tuple(definition.pop(singular_key))
         return None
 
     def _register_default_transforms(self):
@@ -1205,14 +1206,16 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             transformed_keys=(native_key,),
             forward=_identity_transform,
             inverse=_identity_transform,
-            jacobian=_unity_jacobian_transform,
-            raw_definition=dict(native_key=native_key, transformed_key=native_key),
+            jacobian=_zero_log_jacobian_transform,
+            raw_definition=dict(
+                native_keys=(native_key,), transformed_keys=(native_key,)
+            ),
         )
         self._unregister_group((native_key,))
         self._store_transformation_group(definition)
 
     def _normalize_transformation_definition(self, key, definition):
-        native_keys = self._pop_key_tuple(definition, "native_keys", "native_key")
+        native_keys = self._pop_key_tuple(definition, "native_keys")
         if native_keys is None and key in self:
             native_keys = (key,)
         if not native_keys:
@@ -1228,9 +1231,7 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                     native_key,
                 )
                 return None
-        transformed_keys = self._pop_key_tuple(
-            definition, "transformed_keys", "transformed_key"
-        )
+        transformed_keys = self._pop_key_tuple(definition, "transformed_keys")
         if transformed_keys is None and key not in native_keys:
             transformed_keys = (key,)
         if not transformed_keys:
@@ -1243,7 +1244,7 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             )
         forward = definition.pop("forward", _identity_transform)
         inverse = definition.pop("inverse", _identity_transform)
-        jacobian = definition.pop("jacobian", _unity_jacobian_transform)
+        jacobian = definition.pop("jacobian", _zero_log_jacobian_transform)
         raw_definition = dict(definition)
         raw_definition.update(
             native_keys=native_keys,
@@ -1359,7 +1360,7 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             transformed_keys=tuple(transformed_keys),
             forward=forward or _identity_transform,
             inverse=inverse or _identity_transform,
-            jacobian=jacobian or _unity_jacobian_transform,
+            jacobian=jacobian or _zero_log_jacobian_transform,
         )
         normalized = self._normalize_transformation_definition(
             native_keys[0], definition
@@ -1446,12 +1447,13 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                 transformed_values = {key: sample[key] for key in transformed_keys}
                 inverse_result = self._evaluate_inverse(definition, transformed_values)
                 native_sample.update(inverse_result)
-                jacobian_value = self._evaluate_jacobian(definition, inverse_result)
-                term = np.log(np.abs(jacobian_value))
+                log_jacobian_value = self._evaluate_log_jacobian(
+                    definition, transformed_values
+                )
                 if log_abs_det_jacobian is None:
-                    log_abs_det_jacobian = term
+                    log_abs_det_jacobian = log_jacobian_value
                 else:
-                    log_abs_det_jacobian = log_abs_det_jacobian + term
+                    log_abs_det_jacobian = log_abs_det_jacobian + log_jacobian_value
                 if update_least_recently_sampled:
                     for native_key, native_value in inverse_result.items():
                         if native_key in self:
@@ -1483,14 +1485,12 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         result = definition["inverse"](*ordered_values)
         return self._format_group_result(result, definition["native_keys"])
 
-    def _evaluate_jacobian(self, definition, native_values):
-        ordered_values = [native_values[key] for key in definition["native_keys"]]
+    def _evaluate_log_jacobian(self, definition, transformed_values):
+        ordered_values = [
+            transformed_values[key] for key in definition["transformed_keys"]
+        ]
         result = definition["jacobian"](*ordered_values)
-        array = np.asarray(result)
-        dimension = len(definition["native_keys"])
-        if array.ndim >= 2 and array.shape[-2:] == (dimension, dimension):
-            return np.linalg.det(array)
-        return array
+        return np.asarray(result)
 
     def _format_group_result(self, result, keys):
         if isinstance(result, dict):

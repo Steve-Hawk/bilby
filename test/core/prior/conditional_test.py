@@ -462,10 +462,10 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
 
         transformations = {
             "x": dict(
-                transformed_key="log_x",
+                transformed_keys=["log_x"],
                 forward=np.log,
                 inverse=np.exp,
-                jacobian=lambda x: 1.0 / np.asarray(x),
+                jacobian=lambda log_x: -np.asarray(log_x),
             )
         }
 
@@ -561,9 +561,8 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         def inverse(r, theta):
             return r * np.cos(theta), r * np.sin(theta)
 
-        def jacobian(x, y):
-            r = np.sqrt(x ** 2 + y ** 2)
-            return 1.0 / r
+        def jacobian(r, theta):
+            return -np.log(np.asarray(r))
 
         priors = bilby.core.prior.TransformedConditionalPriorDict(
             dictionary={"x": x_prior, "y": y_prior},
@@ -610,9 +609,8 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         def inverse(r, phi):
             return r * np.cos(phi), r * np.sin(phi)
 
-        def jacobian(x, y):
-            r = np.sqrt(x ** 2 + y ** 2)
-            return 1.0 / r
+        def jacobian(r, phi):
+            return -np.log(np.asarray(r))
 
         priors = bilby.core.prior.TransformedConditionalPriorDict(
             dictionary={"x": x_prior, "y": y_prior},

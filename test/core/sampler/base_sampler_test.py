@@ -164,7 +164,7 @@ class TestSamplerWithTransformedPrior(unittest.TestCase):
         native_prior = bilby.core.prior.Uniform(0.5, 2.0, name="x")
         transformations = {
             "x": dict(
-                transformed_key="log_x",
+                transformed_keys=["log_x"],
                 forward=np.log,
                 inverse=np.exp,
                 jacobian=lambda x: 1.0 / np.asarray(x),

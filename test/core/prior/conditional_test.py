@@ -533,6 +533,22 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         )
         self.assertEqual((2, 3), samples.shape)
 
+    def test_to_native_with_ln_prob_returns_native_and_log_prob(self):
+        transformed_sample = self.priors.sample()
+        native_sample, ln_prob = self.priors.to_native_with_ln_prob(transformed_sample)
+
+        self.assertIn("x", native_sample)
+        self.assertIn("y", native_sample)
+        self.assertAlmostEqual(
+            ln_prob,
+            super(
+                bilby.core.prior.TransformedConditionalPriorDict, self.priors
+            ).ln_prob(native_sample),
+        )
+        self.assertAlmostEqual(
+            native_sample["x"], np.exp(transformed_sample["log_x"])
+        )
+
     def test_sample_returns_transformed_keys(self):
         sample = self.priors.sample()
         self.assertIn("log_x", sample)
@@ -589,6 +605,16 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         ).prob(native_sample)
         expected = native_prob / np.exp(log_abs_jacobian)
         self.assertAlmostEqual(expected, priors.prob(sample))
+
+        converted_native, ln_prob = priors.to_native_with_ln_prob(sample)
+        self.assertAlmostEqual(converted_native["x"], expected_x)
+        self.assertAlmostEqual(converted_native["y"], expected_y)
+        self.assertAlmostEqual(
+            ln_prob,
+            super(
+                bilby.core.prior.TransformedConditionalPriorDict, priors
+            ).ln_prob(converted_native),
+        )
 
         transformed_samples = priors.sample_subset(keys=["r", "theta"], size=5)
         self.assertIn("r", transformed_samples)

@@ -1280,7 +1280,7 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         self._store_transformation_group(definition)
 
     def _store_transformation_group(self, definition):
-        native_keys = definition["native_keys"]
+        native_keys = tuple(definition["native_keys"])
         transformed_keys = definition["transformed_keys"]
         group_id = native_keys
         self._transformation_groups[group_id] = definition
@@ -1582,6 +1582,38 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             if key in self._transformed_least_recently_sampled:
                 self._transformed_least_recently_sampled[key] = sample[key]
         return transformed_ln_prob
+
+    def to_native_with_ln_prob(self, sample, axis=None, normalized=True):
+        """Return the native-space sample and its native log probability.
+
+        Parameters
+        ----------
+        sample : dict
+            Mapping of transformed parameter names to values.
+        axis : int, optional
+            Axis along which the probability should be computed, passed through
+            to :meth:`ConditionalPriorDict.ln_prob`.
+        normalized : bool, optional
+            Whether to normalize the probability, also forwarded to the base
+            implementation.
+
+        Returns
+        -------
+        tuple
+            A pair ``(native_sample, native_ln_prob)`` where
+            ``native_sample`` is a dictionary containing the corresponding
+            native parameter values and ``native_ln_prob`` is the log
+            probability evaluated in the native space.
+        """
+
+        native_sample, log_abs_det_jacobian = self._transform_to_native(sample)
+        native_ln_prob = super(TransformedConditionalPriorDict, self).ln_prob(
+            native_sample, axis=axis, normalized=normalized
+        )
+        for key in sample:
+            if key in self._transformed_least_recently_sampled:
+                self._transformed_least_recently_sampled[key] = sample[key]
+        return native_sample, native_ln_prob
 
     # ------------------------------------------------------------------
     # Rescaling utilities

@@ -1132,6 +1132,30 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
             determinant of the Jacobian matrix of the forward transformation
             evaluated in the transformed space. Defaults to a function returning
             zeros with the appropriate shape.
+
+        Examples
+        --------
+        The following snippet shows the essential components for mapping two
+        Cartesian coordinates ``(x, y)`` to polar coordinates ``(r, phi)``. The
+        forward function receives native values and returns transformed ones,
+        the inverse converts back to native space, and the Jacobian reports the
+        logarithm of the absolute determinant evaluated at the transformed
+        inputs (``log(r)`` for this transformation):
+
+        .. code-block:: python
+
+           def forward(x, y):
+               r = np.sqrt(x ** 2 + y ** 2)
+               phi = np.arctan2(y, x)
+               return {"r": r, "phi": phi}
+
+           def inverse(r, phi):
+               x = r * np.cos(phi)
+               y = r * np.sin(phi)
+               return {"x": x, "y": y}
+
+           def log_jacobian(r, phi):
+               return np.log(np.abs(r))
     """
 
     def __init__(

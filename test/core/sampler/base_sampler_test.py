@@ -148,6 +148,118 @@ class TestSampler(unittest.TestCase):
         )
 
 
+class TestSamplerWithTransformedPrior(unittest.TestCase):
+
+    def setUp(self):
+        class NativeLikelihood(bilby.core.likelihood.Likelihood):
+            def __init__(self):
+                super().__init__()
+                self.recorded_parameters = []
+
+            def log_likelihood(self, parameters=None):
+                self.recorded_parameters.append(parameters.copy())
+                return -0.5 * (parameters["x"] - 1.0) ** 2
+
+        self.likelihood = NativeLikelihood()
+        native_prior = bilby.core.prior.Uniform(0.5, 2.0, name="x")
+        transformations = {
+            "x": dict(
+                transformed_keys=["log_x"],
+                forward=np.log,
+                inverse=np.exp,
+                jacobian=lambda x: 1.0 / np.asarray(x),
+            )
+        }
+        self.priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": native_prior}, transformations=transformations
+        )
+        self.outdir = "transformed_test_directory"
+        self.sampler = bilby.core.sampler.Sampler(
+            likelihood=self.likelihood,
+            priors=self.priors,
+            outdir=self.outdir,
+            skip_import_verification=True,
+            soft_init=True,
+        )
+
+    def tearDown(self):
+        if os.path.isdir(self.outdir):
+            shutil.rmtree(self.outdir)
+
+    def test_search_parameter_keys_are_transformed(self):
+        self.assertListEqual(["log_x"], self.sampler.search_parameter_keys)
+
+    def test_log_likelihood_receives_native_parameter(self):
+        theta = [0.0]
+        self.sampler.log_likelihood(theta)
+        self.assertTrue(self.likelihood.recorded_parameters)
+        recorded = self.likelihood.recorded_parameters[-1]
+        self.assertIn("x", recorded)
+        self.assertAlmostEqual(recorded["x"], np.exp(theta[0]))
+
+    def test_sampler_falls_back_to_native_keys_when_group_is_partially_fixed(self):
+        class MixedLikelihood(bilby.core.likelihood.Likelihood):
+            def __init__(self):
+                super().__init__()
+                self.recorded_parameters = []
+
+            def log_likelihood(self, parameters=None):
+                self.recorded_parameters.append(parameters.copy())
+                return -0.5 * (
+                    (parameters["x"] - 0.1) ** 2 + (parameters["y"] + 0.3) ** 2
+                )
+
+        likelihood = MixedLikelihood()
+        x_prior = bilby.core.prior.Uniform(-1.0, 1.0, name="x")
+        y_prior = bilby.core.prior.Uniform(-0.5, 0.5, name="y")
+        z_prior = bilby.core.prior.DeltaFunction(peak=0.2, name="z")
+
+        def forward(x, y, z):
+            return {
+                "u": x + y + z,
+                "v": x - y,
+                "w": y - z,
+            }
+
+        def inverse(u, v, w):
+            y = (u - v + w) / 3.0
+            x = (u + 2.0 * v + w) / 3.0
+            z = (u - v - 2.0 * w) / 3.0
+            return {"x": x, "y": y, "z": z}
+
+        def log_jacobian(u, v, w):
+            return np.log(3.0)
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior, "z": z_prior},
+            transformations={
+                "uvw": dict(
+                    native_keys=["x", "y", "z"],
+                    transformed_keys=["u", "v", "w"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=log_jacobian,
+                )
+            },
+        )
+
+        sampler = bilby.core.sampler.Sampler(
+            likelihood=likelihood,
+            priors=priors,
+            outdir=self.outdir,
+            skip_import_verification=True,
+            soft_init=True,
+        )
+
+        self.assertListEqual(["x", "y"], sampler.search_parameter_keys)
+
+        theta = [0.05, -0.1]
+        sampler.log_likelihood(theta)
+        recorded = likelihood.recorded_parameters[-1]
+        self.assertIn("z", recorded)
+        self.assertAlmostEqual(recorded["z"], 0.2)
+
+
 def test_get_expected_outputs():
     outdir = os.path.join("some", "bilby_pipe", "dir")
     label = "par0"

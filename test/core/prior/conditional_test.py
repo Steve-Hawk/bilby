@@ -500,6 +500,18 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         expected_native = self.native_prior.rescale(theta[0])
         self.assertAlmostEqual(transformed[0], np.log(expected_native))
 
+    def test_transform_native_samples_handles_mixed_keys(self):
+        native_samples = super(
+            bilby.core.prior.TransformedConditionalPriorDict, self.priors
+        ).sample_subset(keys=["x", "y"], size=3)
+        transformed = self.priors._transform_native_samples(
+            native_samples, ["log_x", "x", "y"]
+        )
+        self.assertIn("log_x", transformed)
+        self.assertIn("x", transformed)
+        self.assertIn("y", transformed)
+        np.testing.assert_allclose(np.exp(transformed["log_x"]), transformed["x"])
+
     def test_probability_includes_jacobian(self):
         sample = {"log_x": np.log(1.1), "y": 0.0}
         native_sample, log_abs_jac = self.priors._transform_to_native(sample)

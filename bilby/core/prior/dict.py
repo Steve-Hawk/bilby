@@ -1156,6 +1156,14 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
 
            def log_jacobian(r, phi):
                return np.log(np.abs(r))
+
+        When a transformation group references native parameters whose priors
+        are fixed (for example, a :class:`~bilby.core.prior.DeltaFunction`), the
+        dictionary automatically falls back to exposing the remaining native
+        parameters as the sampler's search coordinates. This prevents the
+        sampler from proposing independent values for transformed coordinates
+        that are no longer freely specifiable once some native degrees of
+        freedom have been fixed.
     """
 
     def __init__(
@@ -1722,10 +1730,29 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
     @property
     def transformed_sorted_keys_without_fixed_parameters(self):
         keys = []
-        for native_key in self.sorted_keys_without_fixed_parameters:
-            for transformed_key in self._transformed_keys_for_native(native_key):
-                if transformed_key not in keys:
-                    keys.append(transformed_key)
+        visited_groups = set()
+        for native_key in self.sorted_keys:
+            group_id = self._group_by_native.get(native_key)
+            if group_id is None or group_id in visited_groups:
+                continue
+            visited_groups.add(group_id)
+            definition = self._transformation_groups.get(group_id)
+            if definition is None:
+                continue
+            native_keys = definition["native_keys"]
+            free_native = [
+                key for key in native_keys if key in self and not self[key].is_fixed
+            ]
+            if not free_native:
+                continue
+            if len(free_native) == len(native_keys):
+                for transformed_key in definition["transformed_keys"]:
+                    if transformed_key not in keys:
+                        keys.append(transformed_key)
+                continue
+            for native in native_keys:
+                if native in free_native and native not in keys:
+                    keys.append(native)
         return keys
 
     @property

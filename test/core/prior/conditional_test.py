@@ -635,6 +635,63 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         rescaled = priors.rescale(["r", "theta"], [0.1, 0.6])
         self.assertEqual(2, len(rescaled))
 
+    def test_partially_fixed_native_group_uses_native_search_keys(self):
+        x_prior = bilby.core.prior.Uniform(minimum=-1.0, maximum=1.0, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=-1.5, maximum=0.5, name="y")
+        z_prior = bilby.core.prior.DeltaFunction(peak=0.2, name="z")
+
+        def forward(x, y, z):
+            u = x + y + z
+            v = x - y
+            w = y - z
+            return {"u": u, "v": v, "w": w}
+
+        def inverse(u, v, w):
+            y = (u - v + w) / 3.0
+            x = (u + 2.0 * v + w) / 3.0
+            z = (u - v - 2.0 * w) / 3.0
+            return {"x": x, "y": y, "z": z}
+
+        def log_jacobian(u, v, w):
+            return np.log(3.0)
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior, "z": z_prior},
+            transformations={
+                "uvw": dict(
+                    native_keys=["x", "y", "z"],
+                    transformed_keys=["u", "v", "w"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=log_jacobian,
+                )
+            },
+        )
+
+        self.assertListEqual(["u", "v", "w"], priors.transformed_keys)
+        self.assertListEqual(["x", "y"], priors.non_fixed_keys)
+
+        native_samples = priors.sample_subset(keys=priors.non_fixed_keys, size=4)
+        self.assertIn("x", native_samples)
+        self.assertIn("y", native_samples)
+        self.assertNotIn("u", native_samples)
+
+        transformed_samples = priors.sample(size=3)
+        self.assertIn("u", transformed_samples)
+        self.assertIn("v", transformed_samples)
+        self.assertIn("w", transformed_samples)
+
+        native_from_transformed, ln_prob = priors.to_native_with_ln_prob(
+            {key: transformed_samples[key] for key in ["u", "v", "w"]}
+        )
+        self.assertIn("z", native_from_transformed)
+        self.assertAlmostEqual(
+            ln_prob,
+            super(
+                bilby.core.prior.TransformedConditionalPriorDict, priors
+            ).ln_prob(native_from_transformed),
+        )
+
     def test_transformed_view_requires_group_values(self):
         x_prior = bilby.core.prior.Uniform(minimum=0.3, maximum=1.2, name="x")
         y_prior = bilby.core.prior.Uniform(minimum=0.4, maximum=1.0, name="y")

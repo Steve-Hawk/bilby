@@ -1157,13 +1157,6 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
            def log_jacobian(r, phi):
                return np.log(np.abs(r))
 
-        When a transformation group references native parameters whose priors
-        are fixed (for example, a :class:`~bilby.core.prior.DeltaFunction`), the
-        dictionary automatically falls back to exposing the remaining native
-        parameters as the sampler's search coordinates. This prevents the
-        sampler from proposing independent values for transformed coordinates
-        that are no longer freely specifiable once some native degrees of
-        freedom have been fixed.
     """
 
     def __init__(
@@ -1734,25 +1727,40 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         for native_key in self.sorted_keys:
             group_id = self._group_by_native.get(native_key)
             if group_id is None or group_id in visited_groups:
+                if group_id is None:
+                    prior = dict.__getitem__(self, native_key)
+                    if not prior.is_fixed and native_key not in keys:
+                        keys.append(native_key)
                 continue
             visited_groups.add(group_id)
             definition = self._transformation_groups.get(group_id)
             if definition is None:
                 continue
             native_keys = definition["native_keys"]
-            free_native = [
-                key for key in native_keys if key in self and not self[key].is_fixed
-            ]
-            if not free_native:
-                continue
-            if len(free_native) == len(native_keys):
-                for transformed_key in definition["transformed_keys"]:
-                    if transformed_key not in keys:
-                        keys.append(transformed_key)
-                continue
-            for native in native_keys:
-                if native in free_native and native not in keys:
-                    keys.append(native)
+            transformed_keys = definition["transformed_keys"]
+            native_priors = [dict.__getitem__(self, key) for key in native_keys]
+            requires_transformation = len(native_keys) > 1 or any(
+                transformed_key != native_key
+                for transformed_key, native_key in zip(
+                    transformed_keys, native_keys
+                )
+            )
+            if requires_transformation and any(prior.is_fixed for prior in native_priors):
+                raise ValueError(
+                    "Cannot sample transformed parameters {} because native parameters {} include fixed values"
+                    .format(transformed_keys, native_keys)
+                )
+            for transformed_key in transformed_keys:
+                transformed_prior = self._transformed_priors.get(transformed_key)
+                if transformed_prior is None and dict.__contains__(self, transformed_key):
+                    transformed_prior = dict.__getitem__(self, transformed_key)
+                if transformed_prior is None:
+                    raise KeyError(
+                        "Unknown transformed key '{}' encountered while determining "
+                        "non-fixed parameters".format(transformed_key)
+                    )
+                if not transformed_prior.is_fixed and transformed_key not in keys:
+                    keys.append(transformed_key)
         return keys
 
     @property

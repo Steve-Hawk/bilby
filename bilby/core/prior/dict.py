@@ -1096,12 +1096,69 @@ class TransformedPriorView(Prior):
         sample = {self.name: val}
         sample.update(kwargs)
         self._require_group_values(sample)
+        if dict.__contains__(self._parent, self.name):
+            with self._parent._native_sampling_context([self.name]):
+                native_prior = self._parent[self.name]
+                native_required = getattr(native_prior, "required_variables", [])
+                native_kwargs = {
+                    var: sample[var]
+                    for var in native_required
+                    if var in sample
+                }
+                result = native_prior.prob(val, **native_kwargs)
+            native_prior.least_recently_sampled = val
+            self.least_recently_sampled = val
+            ratio = self._parent.normalize_constraint_factor((self.name,))
+            if np.all(result == 0.0):
+                return result * ratio
+            if isinstance(result, float):
+                if self._parent.evaluate_constraints(sample):
+                    return result * ratio
+                return 0.0
+            constrained_prob = np.zeros_like(result)
+            in_bounds = np.isfinite(result)
+            subsample = {key: sample[key][in_bounds] for key in sample}
+            keep = np.array(self._parent.evaluate_constraints(subsample), dtype=bool)
+            constrained_prob[in_bounds] = result[in_bounds] * keep * ratio
+            return constrained_prob
         return self._parent.prob(sample)
 
     def ln_prob(self, val, axis=None, normalized=True, **kwargs):
         sample = {self.name: val}
         sample.update(kwargs)
         self._require_group_values(sample)
+        if dict.__contains__(self._parent, self.name):
+            with self._parent._native_sampling_context([self.name]):
+                native_prior = self._parent[self.name]
+                native_required = getattr(native_prior, "required_variables", [])
+                native_kwargs = {
+                    var: sample[var]
+                    for var in native_required
+                    if var in sample
+                }
+                result = native_prior.ln_prob(val, **native_kwargs)
+            native_prior.least_recently_sampled = val
+            self.least_recently_sampled = val
+            if axis is not None:
+                result = np.sum(result, axis=axis)
+            if normalized:
+                ratio = self._parent.normalize_constraint_factor((self.name,))
+            else:
+                ratio = 1
+            if np.all(np.isinf(result)):
+                return result
+            if isinstance(result, float):
+                if self._parent.evaluate_constraints(sample):
+                    return result + np.log(ratio)
+                return -np.inf
+            constrained_ln_prob = -np.inf * np.ones_like(result)
+            in_bounds = np.isfinite(result)
+            subsample = {key: sample[key][in_bounds] for key in sample}
+            keep = np.log(
+                np.array(self._parent.evaluate_constraints(subsample), dtype=bool)
+            )
+            constrained_ln_prob[in_bounds] = result[in_bounds] + keep + np.log(ratio)
+            return constrained_ln_prob
         return self._parent.ln_prob(sample, axis=axis, normalized=normalized)
 
     def cdf(self, val):
@@ -1117,6 +1174,12 @@ class TransformedPriorView(Prior):
         return self._base_prior.cdf(native)
 
     def _require_group_values(self, sample):
+        # If this transformed parameter shares its name with a native prior entry,
+        # callers can evaluate probabilities using the native coordinate without
+        # providing the companion transformed variables.
+        if dict.__contains__(self._parent, self.name):
+            return
+
         missing = [
             key
             for key in self._transformed_keys
@@ -1595,6 +1658,9 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                             transformed_key
                         ] = sample[transformed_key]
             elif any(key in sample for key in transformed_keys):
+                provided = [key for key in transformed_keys if key in sample]
+                if all(dict.__contains__(self, key) for key in provided):
+                    continue
                 missing = [key for key in transformed_keys if key not in sample]
                 raise KeyError(
                     "Sample is missing transformed keys {} required to invert transformation for {}".format(

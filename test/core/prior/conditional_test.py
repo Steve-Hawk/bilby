@@ -554,6 +554,40 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         np.testing.assert_allclose(transformed_samples["z"], expected_z)
         self.assertFalse(np.allclose(transformed_samples["z"], native_samples["z"]))
 
+    def test_overlapping_name_ln_prob_without_companions(self):
+        x_prior = bilby.core.prior.Uniform(minimum=0.1, maximum=1.0, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=0.2, maximum=1.2, name="y")
+        z_prior = bilby.core.prior.Uniform(minimum=1.0, maximum=2.0, name="z")
+
+        def forward(x, y, z):
+            return {"u": x + y, "v": x - y, "z": z + x}
+
+        def inverse(u, v, z):
+            x = 0.5 * (u + v)
+            y = 0.5 * (u - v)
+            return {"x": x, "y": y, "z": z - x}
+
+        def jacobian(u, v, z):
+            return np.log(2.0)
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior, "z": z_prior},
+            transformations={
+                "uvw": dict(
+                    native_keys=["x", "y", "z"],
+                    transformed_keys=["u", "v", "z"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=jacobian,
+                )
+            },
+        )
+
+        value = 1.4
+        expected_ln_prob = z_prior.ln_prob(value)
+        self.assertAlmostEqual(expected_ln_prob, priors["z"].ln_prob(value))
+        self.assertAlmostEqual(expected_ln_prob, priors.ln_prob({"z": value}))
+
     def test_conditional_subset_sampling_with_overlapping_names(self):
         x_prior = bilby.core.prior.Uniform(minimum=0.1, maximum=1.0, name="x")
         y_prior = bilby.core.prior.Uniform(minimum=0.2, maximum=1.2, name="y")

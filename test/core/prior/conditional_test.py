@@ -512,6 +512,48 @@ class TestTransformedConditionalPriorDict(unittest.TestCase):
         self.assertIn("y", transformed)
         np.testing.assert_allclose(np.exp(transformed["log_x"]), transformed["x"])
 
+    def test_transformed_key_shadowing_native_name_uses_transformed_values(self):
+        x_prior = bilby.core.prior.Uniform(minimum=0.1, maximum=1.0, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=0.2, maximum=1.2, name="y")
+        z_prior = bilby.core.prior.Uniform(minimum=1.0, maximum=2.0, name="z")
+
+        def forward(x, y, z):
+            u = x + y
+            v = x - y
+            z_trans = z + x
+            return {"u": u, "v": v, "z": z_trans}
+
+        def inverse(u, v, z):
+            x = 0.5 * (u + v)
+            y = 0.5 * (u - v)
+            z_native = z - x
+            return {"x": x, "y": y, "z": z_native}
+
+        def jacobian(u, v, z):
+            return np.log(2.0)
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior, "z": z_prior},
+            transformations={
+                "uvw": dict(
+                    native_keys=["x", "y", "z"],
+                    transformed_keys=["u", "v", "z"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=jacobian,
+                )
+            },
+        )
+
+        transformed_samples = priors.sample_subset(keys=["u", "v", "z"], size=7)
+
+        native_samples, _ = priors._transform_to_native(
+            {key: transformed_samples[key] for key in ["u", "v", "z"]}
+        )
+        expected_z = native_samples["z"] + native_samples["x"]
+        np.testing.assert_allclose(transformed_samples["z"], expected_z)
+        self.assertFalse(np.allclose(transformed_samples["z"], native_samples["z"]))
+
     def test_probability_includes_jacobian(self):
         sample = {"log_x": np.log(1.1), "y": 0.0}
         native_sample, log_abs_jac = self.priors._transform_to_native(sample)

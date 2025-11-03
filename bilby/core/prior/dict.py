@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from contextlib import contextmanager
 from importlib import import_module
 from io import open as ioopen
 from warnings import warn
@@ -1429,6 +1430,17 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
     # ------------------------------------------------------------------
     # Transformation helpers
     # ------------------------------------------------------------------
+    @contextmanager
+    def _native_sampling_context(self, native_keys):
+        removed = {}
+        try:
+            for key in native_keys:
+                if key in self._transformed_priors and dict.__contains__(self, key):
+                    removed[key] = self._transformed_priors.pop(key)
+            yield
+        finally:
+            self._transformed_priors.update(removed)
+
     def _transform_native_samples(self, samples, transformed_keys):
         """Map native-space samples into the requested coordinate system.
 
@@ -1452,12 +1464,12 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         transformed_samples = dict()
         group_cache = dict()
         for key in transformed_keys:
-            if dict.__contains__(self, key):
+            mapping = self._group_by_transformed.get(key)
+            if mapping is None and dict.__contains__(self, key):
                 if key in samples:
                     transformed_samples[key] = samples[key]
                     self._transformed_least_recently_sampled[key] = samples[key]
                 continue
-            mapping = self._group_by_transformed.get(key)
             if mapping is None:
                 raise KeyError(
                     "Unknown transformed key '{}' requested from native samples".format(
@@ -1479,6 +1491,11 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
                     if native_key in samples
                 }
                 if len(native_values) != len(definition["native_keys"]):
+                    if dict.__contains__(self, key):
+                        if key in samples:
+                            transformed_samples[key] = samples[key]
+                            self._transformed_least_recently_sampled[key] = samples[key]
+                        continue
                     missing = [
                         native_key
                         for native_key in definition["native_keys"]
@@ -1604,9 +1621,10 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         if len(keys) == 0:
             keys = self.transformed_keys
         native_keys = self._convert_keys_to_native(keys)
-        native_samples = super(TransformedConditionalPriorDict, self).sample_subset(
-            keys=native_keys, size=size
-        )
+        with self._native_sampling_context(native_keys):
+            native_samples = super(TransformedConditionalPriorDict, self).sample_subset(
+                keys=native_keys, size=size
+            )
         return self._transform_native_samples(native_samples, keys)
 
     def sample_subset_constrained(self, keys=iter([]), size=None):
@@ -1614,9 +1632,10 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         if len(keys) == 0:
             keys = self.transformed_keys
         native_keys = self._convert_keys_to_native(keys)
-        native_samples = super(
-            TransformedConditionalPriorDict, self
-        ).sample_subset_constrained(keys=native_keys, size=size)
+        with self._native_sampling_context(native_keys):
+            native_samples = super(
+                TransformedConditionalPriorDict, self
+            ).sample_subset_constrained(keys=native_keys, size=size)
         return self._transform_native_samples(native_samples, keys)
 
     def sample_subset_constrained_as_array(self, keys=iter([]), size=None):

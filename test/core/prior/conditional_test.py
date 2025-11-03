@@ -446,6 +446,282 @@ class TestConditionalPriorDict(unittest.TestCase):
             prior.sample_subset(["tp"], 1000)
 
 
+class TestTransformedConditionalPriorDict(unittest.TestCase):
+
+    def setUp(self):
+        self.native_prior = bilby.core.prior.Uniform(minimum=0.5, maximum=2.0, name="x")
+        self.other_prior = bilby.core.prior.Uniform(minimum=-1.0, maximum=1.0, name="y")
+
+        def conversion(sample):
+            converted = dict(sample)
+            if "log_x" in converted and "log_x_constraint" not in converted:
+                converted["log_x_constraint"] = converted["log_x"]
+            if "x" in converted and "log_x_constraint" not in converted:
+                converted["log_x_constraint"] = np.log(converted["x"])
+            return converted
+
+        transformations = {
+            "x": dict(
+                transformed_keys=["log_x"],
+                forward=np.log,
+                inverse=np.exp,
+                jacobian=lambda log_x: -np.asarray(log_x),
+            )
+        }
+
+        self.priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": self.native_prior, "y": self.other_prior},
+            transformations=transformations,
+            conversion_function=conversion,
+        )
+        self.priors["log_x_constraint"] = bilby.core.prior.Constraint(
+            minimum=-0.5, maximum=0.5
+        )
+
+    def test_transformed_keys(self):
+        self.assertListEqual(
+            ["log_x", "y", "log_x_constraint"], self.priors.transformed_keys
+        )
+
+    def test_sample_subset_uses_forward_transformation(self):
+        samples = self.priors.sample_subset(keys=["log_x"], size=5)
+        self.assertIn("log_x", samples)
+        native_samples = np.exp(samples["log_x"])
+        self.assertTrue(
+            np.all(
+                (native_samples >= self.native_prior.minimum)
+                & (native_samples <= self.native_prior.maximum)
+            )
+        )
+
+    def test_rescale_applies_transformation(self):
+        theta = [0.3, 0.8]
+        transformed = self.priors.rescale(["log_x", "y"], theta)
+        expected_native = self.native_prior.rescale(theta[0])
+        self.assertAlmostEqual(transformed[0], np.log(expected_native))
+
+    def test_transform_native_samples_handles_mixed_keys(self):
+        native_samples = super(
+            bilby.core.prior.TransformedConditionalPriorDict, self.priors
+        ).sample_subset(keys=["x", "y"], size=3)
+        transformed = self.priors._transform_native_samples(
+            native_samples, ["log_x", "x", "y"]
+        )
+        self.assertIn("log_x", transformed)
+        self.assertIn("x", transformed)
+        self.assertIn("y", transformed)
+        np.testing.assert_allclose(np.exp(transformed["log_x"]), transformed["x"])
+
+    def test_registering_overlapping_native_and_transformed_keys_raises(self):
+        x_prior = bilby.core.prior.Uniform(minimum=0.1, maximum=1.0, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=0.2, maximum=1.2, name="y")
+        z_prior = bilby.core.prior.Uniform(minimum=1.0, maximum=2.0, name="z")
+
+        with self.assertRaisesRegex(ValueError, "native keys as transformed keys"):
+            bilby.core.prior.TransformedConditionalPriorDict(
+                dictionary={"x": x_prior, "y": y_prior, "z": z_prior},
+                transformations={
+                    "uvw": dict(
+                        native_keys=["x", "y", "z"],
+                        transformed_keys=["u", "v", "z"],
+                        forward=lambda x, y, z: {"u": x + y, "v": x - y, "z": z + x},
+                        inverse=lambda u, v, z: {
+                            "x": 0.5 * (u + v),
+                            "y": 0.5 * (u - v),
+                            "z": z - 0.5 * (u + v),
+                        },
+                        jacobian=lambda u, v, z: np.log(2.0),
+                    )
+                },
+            )
+
+    def test_probability_includes_jacobian(self):
+        sample = {"log_x": np.log(1.1), "y": 0.0}
+        native_sample, log_abs_jac = self.priors._transform_to_native(sample)
+        native_prob = super(
+            bilby.core.prior.TransformedConditionalPriorDict, self.priors
+        ).prob(native_sample)
+        expected = native_prob / np.exp(log_abs_jac)
+        self.assertAlmostEqual(expected, self.priors.prob(sample))
+
+    def test_ln_probability_matches_log(self):
+        sample = {"log_x": np.log(1.4), "y": 0.2}
+        prob = self.priors.prob(sample)
+        self.assertAlmostEqual(np.log(prob), self.priors.ln_prob(sample))
+
+    def test_transformed_constraint_is_applied(self):
+        valid_sample = {"log_x": np.log(1.2), "y": 0.0}
+        invalid_sample = {"log_x": np.log(1.7), "y": 0.0}
+        self.assertGreater(self.priors.prob(valid_sample), 0.0)
+        self.assertEqual(0.0, self.priors.prob(invalid_sample))
+
+    def test_rescale_updates_transformed_tracking(self):
+        theta = [0.4, 0.5]
+        values = self.priors.rescale(["log_x", "y"], theta)
+        tracked = self.priors.transformed_least_recently_sampled
+        self.assertAlmostEqual(tracked["log_x"], values[0])
+        self.assertAlmostEqual(tracked["y"], values[1])
+
+    def test_sample_subset_constrained_as_array_shape(self):
+        samples = self.priors.sample_subset_constrained_as_array(
+            keys=["log_x", "y"], size=3
+        )
+        self.assertEqual((2, 3), samples.shape)
+
+    def test_to_native_with_ln_prob_returns_native_and_log_prob(self):
+        transformed_sample = self.priors.sample()
+        native_sample, ln_prob = self.priors.to_native_with_ln_prob(transformed_sample)
+
+        self.assertIn("x", native_sample)
+        self.assertIn("y", native_sample)
+        self.assertAlmostEqual(
+            ln_prob,
+            super(
+                bilby.core.prior.TransformedConditionalPriorDict, self.priors
+            ).ln_prob(native_sample),
+        )
+        self.assertAlmostEqual(
+            native_sample["x"], np.exp(transformed_sample["log_x"])
+        )
+
+    def test_sample_returns_transformed_keys(self):
+        sample = self.priors.sample()
+        self.assertIn("log_x", sample)
+        self.assertIn("y", sample)
+        self.assertNotIn("x", sample)
+
+    def test_non_fixed_keys_match_transformed(self):
+        self.assertListEqual(
+            ["log_x", "y"], self.priors.non_fixed_keys
+        )
+
+    def test_conversion_function_includes_native_parameters(self):
+        converted = self.priors.conversion_function({"log_x": np.log(1.3), "y": 0.1})
+        self.assertIn("x", converted)
+        self.assertAlmostEqual(converted["x"], np.exp(np.log(1.3)))
+
+    def test_multi_parameter_transformation_probability(self):
+        x_prior = bilby.core.prior.Uniform(minimum=0.5, maximum=1.5, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=0.25, maximum=1.0, name="y")
+
+        def forward(x, y):
+            r = np.sqrt(x ** 2 + y ** 2)
+            theta = np.arctan2(y, x)
+            return r, theta
+
+        def inverse(r, theta):
+            return r * np.cos(theta), r * np.sin(theta)
+
+        def jacobian(r, theta):
+            return -np.log(np.asarray(r))
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior},
+            transformations={
+                "polar": dict(
+                    native_keys=["x", "y"],
+                    transformed_keys=["r", "theta"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=jacobian,
+                    minimum={"r": np.sqrt(0.5 ** 2 + 0.25 ** 2), "theta": -np.pi},
+                    maximum={"r": np.sqrt(1.5 ** 2 + 1.0 ** 2), "theta": np.pi},
+                )
+            },
+        )
+
+        sample = {"r": 0.9, "theta": 0.4}
+        native_sample, log_abs_jacobian = priors._transform_to_native(sample)
+        expected_x, expected_y = inverse(sample["r"], sample["theta"])
+        self.assertAlmostEqual(native_sample["x"], expected_x)
+        self.assertAlmostEqual(native_sample["y"], expected_y)
+        native_prob = super(
+            bilby.core.prior.TransformedConditionalPriorDict, priors
+        ).prob(native_sample)
+        expected = native_prob / np.exp(log_abs_jacobian)
+        self.assertAlmostEqual(expected, priors.prob(sample))
+
+        converted_native, ln_prob = priors.to_native_with_ln_prob(sample)
+        self.assertAlmostEqual(converted_native["x"], expected_x)
+        self.assertAlmostEqual(converted_native["y"], expected_y)
+        self.assertAlmostEqual(
+            ln_prob,
+            super(
+                bilby.core.prior.TransformedConditionalPriorDict, priors
+            ).ln_prob(converted_native),
+        )
+
+        transformed_samples = priors.sample_subset(keys=["r", "theta"], size=5)
+        self.assertIn("r", transformed_samples)
+        self.assertIn("theta", transformed_samples)
+
+        rescaled = priors.rescale(["r", "theta"], [0.1, 0.6])
+        self.assertEqual(2, len(rescaled))
+
+    def test_transformed_view_requires_group_values(self):
+        x_prior = bilby.core.prior.Uniform(minimum=0.3, maximum=1.2, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=0.4, maximum=1.0, name="y")
+
+        def forward(x, y):
+            r = np.sqrt(x ** 2 + y ** 2)
+            phi = np.arctan2(y, x)
+            return r, phi
+
+        def inverse(r, phi):
+            return r * np.cos(phi), r * np.sin(phi)
+
+        def jacobian(r, phi):
+            return -np.log(np.asarray(r))
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior},
+            transformations={
+                "polar": dict(
+                    native_keys=["x", "y"],
+                    transformed_keys=["radius", "phi"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=jacobian,
+                )
+            },
+        )
+
+        radius_prior = priors["radius"]
+        with self.assertRaises(KeyError):
+            radius_prior.prob(0.8)
+        prob = radius_prior.prob(0.8, phi=0.3)
+        self.assertIsInstance(prob, float)
+
+    def test_non_fixed_keys_raise_on_degree_mismatch(self):
+        x_prior = bilby.core.prior.DeltaFunction(peak=0.0, name="x")
+        y_prior = bilby.core.prior.Uniform(minimum=-1.0, maximum=1.0, name="y")
+
+        def forward(x, y):
+            return {"u": x + y, "v": x - y}
+
+        def inverse(u, v):
+            return {"x": 0.5 * (u + v), "y": 0.5 * (u - v)}
+
+        def jacobian(u, v):
+            return np.log(2.0)
+
+        priors = bilby.core.prior.TransformedConditionalPriorDict(
+            dictionary={"x": x_prior, "y": y_prior},
+            transformations={
+                "uv": dict(
+                    native_keys=["x", "y"],
+                    transformed_keys=["u", "v"],
+                    forward=forward,
+                    inverse=inverse,
+                    jacobian=jacobian,
+                )
+            },
+        )
+
+        with self.assertRaises(ValueError):
+            _ = priors.non_fixed_keys
+
+
 class TestDirichletPrior(unittest.TestCase):
 
     def setUp(self):

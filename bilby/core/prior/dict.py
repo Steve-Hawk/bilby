@@ -1186,6 +1186,16 @@ class TransformedPriorView(Prior):
             if key not in sample and key != self.name
         ]
         if missing:
+            for key in list(missing):
+                cached = self._parent._transformed_least_recently_sampled.get(key)
+                if cached is not None:
+                    sample[key] = cached
+            missing = [
+                key
+                for key in self._transformed_keys
+                if key not in sample and key != self.name
+            ]
+        if missing:
             raise KeyError(
                 "Values for transformed keys {} are required to evaluate '{}'".format(
                     missing, self.name
@@ -1400,6 +1410,14 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
     def _register_transformation_group(
         self, native_keys, transformed_keys, forward, inverse, jacobian, raw_definition
     ):
+        overlap = set(native_keys) & set(transformed_keys)
+        if overlap:
+            overlap_list = ", ".join(sorted(overlap))
+            raise ValueError(
+                "Transformation cannot reuse native keys as transformed keys: {}".format(
+                    overlap_list
+                )
+            )
         for native_key in native_keys:
             group_id = self._group_by_native.get(native_key)
             if group_id is not None:

@@ -1039,8 +1039,54 @@ class TransformedPriorView(Prior):
         return self._base_prior.minimum, self._base_prior.maximum
 
     def sample(self, size=None, **kwargs):
+        if kwargs:
+            transformed = self._sample_with_required_variables(size=size, **kwargs)
+            if transformed is not None:
+                return transformed
         samples = self._parent.sample_subset(keys=[self.name], size=size)
         return samples[self.name]
+
+    def _sample_with_required_variables(self, size=None, **kwargs):
+        definition = self._definition
+        group_keys = definition["transformed_keys"]
+        native_keys = list(definition["native_keys"])
+        with self._parent._native_sampling_context(native_keys):
+            baseline_native = super(
+                TransformedConditionalPriorDict, self._parent
+            ).sample_subset(keys=native_keys, size=size)
+        transformed_values = self._parent._evaluate_forward(
+            definition, baseline_native
+        )
+        for key in group_keys:
+            if key in kwargs and kwargs[key] is not None:
+                transformed_values[key] = kwargs[key]
+            elif key not in transformed_values:
+                cached = self._parent._transformed_least_recently_sampled.get(key)
+                if cached is not None:
+                    transformed_values[key] = cached
+        try:
+            native_values = self._parent._evaluate_inverse(
+                definition, transformed_values
+            )
+        except Exception:
+            return None
+        native_key = self._native_keys[self._index]
+        required_native = {}
+        for native_required in getattr(self._base_prior, "required_variables", []):
+            if native_required not in native_values:
+                return None
+            required_native[native_required] = native_values[native_required]
+        sampled_native = self._base_prior.sample(size=size, **required_native)
+        native_values[native_key] = sampled_native
+        for native_name, native_val in native_values.items():
+            if dict.__contains__(self._parent, native_name):
+                dict.__getitem__(self._parent, native_name).least_recently_sampled = (
+                    native_val
+                )
+        forward_values = self._parent._evaluate_forward(definition, native_values)
+        for transformed_key, value in forward_values.items():
+            self._parent._transformed_least_recently_sampled[transformed_key] = value
+        return forward_values[self.name]
 
     def rescale(self, val, **kwargs):
         result = self._parent.rescale([self.name], [val])
@@ -1408,16 +1454,16 @@ class TransformedConditionalPriorDict(ConditionalPriorDict):
         return list(definition["transformed_keys"])
 
     def _native_keys_for(self, key):
+        mapping = self._group_by_transformed.get(key)
+        if mapping is not None:
+            group_id, _ = mapping
+            definition = self._transformation_groups.get(group_id)
+            if definition is None:
+                raise KeyError("Unknown key '{}'".format(key))
+            return list(definition["native_keys"])
         if dict.__contains__(self, key):
             return [key]
-        mapping = self._group_by_transformed.get(key)
-        if mapping is None:
-            raise KeyError("Unknown key '{}'".format(key))
-        group_id, _ = mapping
-        definition = self._transformation_groups.get(group_id)
-        if definition is None:
-            raise KeyError("Unknown key '{}'".format(key))
-        return list(definition["native_keys"])
+        raise KeyError("Unknown key '{}'".format(key))
 
     def _convert_keys_to_native(self, keys):
         native_keys = []
